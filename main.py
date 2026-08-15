@@ -1,6 +1,14 @@
-# main.py - Saurabh Daddy Test Series (Manual CBT Builder) v3.2
-# v3.2: seed_users ab har startup par admin/admin123 force-reset karta hai
-#       => purana cbt.db repo me chala jaye to bhi login kabhi fail nahi hoga
+# main.py - Saurabh Daddy Test Series (Manual CBT Builder) v3.4
+# v3.4 fixes (v3.3 ke upar):
+#  - PDF ab database me save hota hai (pdf_data) => Render restart/OOM ke baad bhi
+#    draft click karte hi pura resume (page images + crops + answers) milta hai
+#  - PDF bytes memory cache => har request par DB hit nahi, fast rahta hai
+# v3.3 fixes (yahi the):
+#  1) Login ab: username = saurabh69 , password = saurabhpapa (har startup par force reset)
+#  2) Data safety: PDF rendering serial (PDF_LOCK) => 70-80 crops par memory spike/505 nahi
+#     SQLite WAL mode => crash par bhi last committed data safe
+#     DATABASE_URL (Postgres) support => restart/redeploy par bhi kuch nahi udta
+#  3) Har unexpected error ab clean JSON 500 deta hai, process nahi marta
 from __future__ import annotations
 
 import base64
@@ -8,11 +16,12 @@ import hashlib
 import json
 import os
 import time
+from threading import Lock
 from uuid import uuid4
 
 from fastapi import (FastAPI, UploadFile, File, Form, Body, Header,
-                     HTTPException, BackgroundTasks)
-from fastapi.responses import HTMLResponse, Response, FileResponse
+                     HTTPException, BackgroundTasks, Request)
+from fastapi.responses import HTMLResponse, Response, FileResponse, JSONResponse
 
 import database as db
 import jee_player as jp
@@ -34,7 +43,64 @@ FINAL_DIR = os.path.join(BASE_DIR, "final_html")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(FINAL_DIR, exist_ok=True)
 
-app = FastAPI(title="Manual CBT Builder", version="3.2", docs_url=None, redoc_url=None)
+app = FastAPI(title="Manual CBT Builder", version="3.4", docs_url=None, redoc_url=None)
+
+
+# ================= SAFETY (505/OOM + data loss fix) =================
+
+# PDF rendering ko serial karo => ek saath kai requests PDF na kholen,
+# warna memory spike hoke Render container crash karta hai (505 + data udna)
+PDF_LOCK = Lock()
+
+# SQLite WAL mode => process beech me mar jaye tab bhi last committed data safe
+if getattr(db, "engine", None) is not None:
+    try:
+        from sqlalchemy import event as sa_event
+        if str(db.engine.url).startswith("sqlite"):
+            @sa_event.listens_for(db.engine, "connect")
+            def _sqlite_pragmas(dbapi_conn, connection_record):
+                cur = dbapi_conn.cursor()
+                cur.execute("PRAGMA journal_mode=WAL")
+                cur.execute("PRAGMA synchronous=NORMAL")
+                cur.execute("PRAGMA busy_timeout=15000")
+                cur.close()
+    except Exception:
+        pass
+
+# ============ PDF IN DATABASE (restart ke baad bhi resume) ============
+# Render free ki disk ephemeral hai - isliye PDF bytes DB me rakhte hain.
+# Memory cache => baar-baar DB query nahi karni padti.
+
+_PDF_CACHE: dict = {}
+
+
+def get_pdf_bytes(draft_id: int) -> bytes:
+    cached = _PDF_CACHE.get(draft_id)
+    if cached is not None:
+        return cached
+    s = db.SessionLocal()
+    try:
+        d = s.get(db.Draft, draft_id)
+        if d is None:
+            raise HTTPException(404, "Draft not found")
+        data = d.pdf_data
+    finally:
+        s.close()
+    if data is None:
+        # Legacy draft (purana wala): PDF disk par pada hai
+        d = get_draft(draft_id)
+        if not d.pdf_path or not os.path.exists(d.pdf_path):
+            raise HTTPException(410, "PDF file missing - draft dobara upload karo")
+        with open(d.pdf_path, "rb") as f:
+            data = f.read()
+    if len(_PDF_CACHE) >= 6:  # sirf chhota cache rakho
+        _PDF_CACHE.pop(next(iter(_PDF_CACHE)))
+    _PDF_CACHE[draft_id] = data
+    return data
+
+
+def open_draft_pdf(draft_id: int):
+    return fitz.open(stream=get_pdf_bytes(draft_id), filetype="pdf")
 
 
 # ================= AUTH =================
@@ -48,17 +114,23 @@ def user_token(username: str, password_hash: str) -> str:
 
 
 def seed_users():
-    """Har startup par force: admin/admin123 current secret ke saath.
-    Purana cbt.db (galat secret wala) bhi mil jaye to login 100% chalega."""
+    """Har startup par force: saurabh69 / saurabhpapa main admin.
+    Purana 'admin' user auto-delete => sirf saurabh69 hi main login."""
     s = db.SessionLocal()
-    u = s.query(db.User).filter(db.User.username == "admin").first()
-    if u is None:
-        s.add(db.User(name="Admin", username="admin",
-                      password_hash=hash_password("admin123")))
-    else:
-        u.password_hash = hash_password("admin123")
-    s.commit()
-    s.close()
+    try:
+        u = s.query(db.User).filter(db.User.username == "saurabh69").first()
+        if u is None:
+            s.add(db.User(name="Saurabh", username="saurabh69",
+                          password_hash=hash_password("saurabhpapa")))
+        else:
+            u.name = "Saurabh"
+            u.password_hash = hash_password("saurabhpapa")
+        old = s.query(db.User).filter(db.User.username == "admin").first()
+        if old is not None:
+            s.delete(old)
+        s.commit()
+    finally:
+        s.close()
 
 
 def require_admin(authorization: str | None = Header(None)) -> str:
@@ -105,10 +177,12 @@ def qlist(d) -> list:
 
 def save_questions(draft_id: int, questions: list):
     s = db.SessionLocal()
-    d = s.get(db.Draft, draft_id)
-    d.questions = json.dumps(questions)
-    s.commit()
-    s.close()
+    try:
+        d = s.get(db.Draft, draft_id)
+        d.questions = json.dumps(questions)
+        s.commit()
+    finally:
+        s.close()
 
 
 def pix_png(pix):
@@ -170,6 +244,15 @@ def remove_final_paper(final_id: int, path: str):
 
 seed_users()
 cleanup_orphan_files()  # startup par purani orphan files hata do
+
+
+# ================= GLOBAL ERROR HANDLER =================
+# Koi bhi unexpected error => clean JSON 500, server crash nahi, data safe
+
+@app.exception_handler(Exception)
+async def global_error_handler(request: Request, exc: Exception):
+    return JSONResponse(status_code=500,
+                        content={"detail": f"Internal error: {exc}"})
 
 
 # ================= PUBLIC =================
@@ -251,14 +334,15 @@ def user_add(body: dict = Body(...), authorization: str | None = Header(None)):
     if not username or not password:
         raise HTTPException(400, "Username and password are required")
     s = db.SessionLocal()
-    if s.query(db.User).filter(db.User.username == username).first():
+    try:
+        if s.query(db.User).filter(db.User.username == username).first():
+            raise HTTPException(400, "Username already exists")
+        u = db.User(name=name or username, username=username,
+                    password_hash=hash_password(password))
+        s.add(u)
+        s.commit()
+    finally:
         s.close()
-        raise HTTPException(400, "Username already exists")
-    u = db.User(name=name or username, username=username,
-                password_hash=hash_password(password))
-    s.add(u)
-    s.commit()
-    s.close()
     return {"ok": True, "username": username}
 
 
@@ -266,19 +350,18 @@ def user_add(body: dict = Body(...), authorization: str | None = Header(None)):
 def user_delete(user_id: int, authorization: str | None = Header(None)):
     me = require_admin(authorization)
     s = db.SessionLocal()
-    u = s.get(db.User, user_id)
-    if u is None:
+    try:
+        u = s.get(db.User, user_id)
+        if u is None:
+            raise HTTPException(404, "User not found")
+        if u.username == me:
+            raise HTTPException(400, "Apna account delete nahi kar sakte")
+        if u.username == "saurabh69":
+            raise HTTPException(400, "Main admin delete nahi kar sakte")
+        s.delete(u)
+        s.commit()
+    finally:
         s.close()
-        raise HTTPException(404, "User not found")
-    if u.username == me:
-        s.close()
-        raise HTTPException(400, "Apna account delete nahi kar sakte")
-    if u.username == "admin":
-        s.close()
-        raise HTTPException(400, "Main admin delete nahi kar sakte")
-    s.delete(u)
-    s.commit()
-    s.close()
     return {"ok": True}
 
 
@@ -307,25 +390,24 @@ async def new_draft(question_pdf: UploadFile = File(...),
     data = await question_pdf.read()
     if not data:
         raise HTTPException(400, "Empty PDF")
-    path = os.path.join(UPLOAD_DIR, uuid4().hex + ".pdf")
-    with open(path, "wb") as f:
-        f.write(data)
     try:
-        doc = fitz.open(path)
+        doc = fitz.open(stream=data, filetype="pdf")
         page_count = doc.page_count
         doc.close()
     except Exception:
-        os.remove(path)
         raise HTTPException(400, "Not a valid PDF")
     t = title.strip() or (question_pdf.filename or "Untitled Test").replace(".pdf", "")
     s = db.SessionLocal()
-    d = db.Draft(title=t, pdf_path=path, page_count=page_count,
-                 settings=json.dumps({"duration": duration, "positive": positive,
-                                      "negative": negative}))
-    s.add(d)
-    s.commit()
-    s.refresh(d)
-    s.close()
+    try:
+        d = db.Draft(title=t, pdf_data=data, page_count=page_count,
+                     settings=json.dumps({"duration": duration, "positive": positive,
+                                          "negative": negative}))
+        s.add(d)
+        s.commit()
+        s.refresh(d)
+        _PDF_CACHE[d.id] = data   # PDF DB me => restart ke baad bhi resume
+    finally:
+        s.close()
     return {"draft_id": d.id, "page_count": page_count,
             "builder_url": f"/admin/builder/{d.id}"}
 
@@ -339,11 +421,14 @@ def delete_draft(draft_id: int, authorization: str | None = Header(None)):
             os.remove(d.pdf_path)
     except OSError:
         pass
+    _PDF_CACHE.pop(draft_id, None)
     s = db.SessionLocal()
-    d = s.get(db.Draft, draft_id)
-    s.delete(d)
-    s.commit()
-    s.close()
+    try:
+        d = s.get(db.Draft, draft_id)
+        s.delete(d)
+        s.commit()
+    finally:
+        s.close()
     return {"ok": True}
 
 
@@ -366,9 +451,12 @@ def page_image(draft_id: int, page: int):
     d = get_draft(draft_id)
     if not (1 <= page <= d.page_count):
         raise HTTPException(404, "Page out of range")
-    doc = fitz.open(d.pdf_path)
-    pix = doc[page - 1].get_pixmap(matrix=fitz.Matrix(ZOOM, ZOOM))
-    doc.close()
+    with PDF_LOCK:
+        doc = open_draft_pdf(draft_id)
+        try:
+            pix = doc[page - 1].get_pixmap(matrix=fitz.Matrix(ZOOM, ZOOM))
+        finally:
+            doc.close()
     return Response(content=pix_png(pix), media_type="image/png")
 
 
@@ -379,11 +467,14 @@ def preview_crop(draft_id: int, body: dict = Body(...),
     d = get_draft(draft_id)
     page = int(body["page"])
     rect = [int(x) for x in body["rect"]]
-    doc = fitz.open(d.pdf_path)
-    pix = doc[page - 1].get_pixmap(matrix=fitz.Matrix(ZOOM, ZOOM),
-                                   clip=fitz.Rect(rect[0] / ZOOM, rect[1] / ZOOM,
-                                                  rect[2] / ZOOM, rect[3] / ZOOM))
-    doc.close()
+    with PDF_LOCK:
+        doc = open_draft_pdf(draft_id)
+        try:
+            pix = doc[page - 1].get_pixmap(matrix=fitz.Matrix(ZOOM, ZOOM),
+                                           clip=fitz.Rect(rect[0] / ZOOM, rect[1] / ZOOM,
+                                                          rect[2] / ZOOM, rect[3] / ZOOM))
+        finally:
+            doc.close()
     return Response(content=pix_png(pix), media_type="image/png")
 
 
@@ -393,10 +484,13 @@ def question_image(draft_id: int, no: int):
     q = next((q for q in qlist(d) if q["no"] == no), None)
     if q is None or q["type"] != "image":
         raise HTTPException(404, "Question not found")
-    doc = fitz.open(d.pdf_path)
-    pix = doc[q["page"] - 1].get_pixmap(matrix=fitz.Matrix(ZOOM, ZOOM),
-                                        clip=fitz.Rect(*(x / ZOOM for x in q["rect"])))
-    doc.close()
+    with PDF_LOCK:
+        doc = open_draft_pdf(draft_id)
+        try:
+            pix = doc[q["page"] - 1].get_pixmap(matrix=fitz.Matrix(ZOOM, ZOOM),
+                                                clip=fitz.Rect(*(x / ZOOM for x in q["rect"])))
+        finally:
+            doc.close()
     return Response(content=pix_png(pix), media_type="image/png")
 
 
@@ -479,11 +573,13 @@ def insert_question(draft_id: int, body: dict = Body(...),
         else:
             new_ans[str(ki + 1)] = v
     s = db.SessionLocal()
-    dd = s.get(db.Draft, draft_id)
-    dd.questions = json.dumps(out)
-    dd.answers = json.dumps(new_ans)
-    s.commit()
-    s.close()
+    try:
+        dd = s.get(db.Draft, draft_id)
+        dd.questions = json.dumps(out)
+        dd.answers = json.dumps(new_ans)
+        s.commit()
+    finally:
+        s.close()
     return {"ok": True, "no": new_no, "total": len(out)}
 
 
@@ -503,11 +599,13 @@ def delete_question(draft_id: int, no: int, authorization: str | None = Header(N
         elif ki > no:
             new_ans[str(ki - 1)] = v
     s = db.SessionLocal()
-    d = s.get(db.Draft, draft_id)
-    d.questions = json.dumps(qs)
-    d.answers = json.dumps(new_ans)
-    s.commit()
-    s.close()
+    try:
+        d = s.get(db.Draft, draft_id)
+        d.questions = json.dumps(qs)
+        d.answers = json.dumps(new_ans)
+        s.commit()
+    finally:
+        s.close()
     return {"ok": True}
 
 
@@ -523,10 +621,12 @@ def save_answer(draft_id: int, body: dict = Body(...),
     answers = json.loads(d.answers or "{}")
     answers[str(no)] = ans
     s = db.SessionLocal()
-    d = s.get(db.Draft, draft_id)
-    d.answers = json.dumps(answers)
-    s.commit()
-    s.close()
+    try:
+        d = s.get(db.Draft, draft_id)
+        d.answers = json.dumps(answers)
+        s.commit()
+    finally:
+        s.close()
     return {"ok": True}
 
 
@@ -537,10 +637,12 @@ def to_answers(draft_id: int, authorization: str | None = Header(None)):
     if not qlist(d):
         raise HTTPException(400, "Add at least one question first")
     s = db.SessionLocal()
-    d = s.get(db.Draft, draft_id)
-    d.status = "answers_pending"
-    s.commit()
-    s.close()
+    try:
+        d = s.get(db.Draft, draft_id)
+        d.status = "answers_pending"
+        s.commit()
+    finally:
+        s.close()
     return {"ok": True}
 
 
@@ -548,10 +650,12 @@ def to_answers(draft_id: int, authorization: str | None = Header(None)):
 def reopen(draft_id: int, authorization: str | None = Header(None)):
     require_admin(authorization)
     s = db.SessionLocal()
-    d = s.get(db.Draft, draft_id)
-    d.status = "building"
-    s.commit()
-    s.close()
+    try:
+        d = s.get(db.Draft, draft_id)
+        d.status = "building"
+        s.commit()
+    finally:
+        s.close()
     return {"ok": True}
 
 
@@ -564,23 +668,28 @@ def publish(draft_id: int, authorization: str | None = Header(None)):
     if len(answers) < len(qs):
         raise HTTPException(400, f"Mark answers for {len(qs) - len(answers)} more question(s)")
     final = []
-    doc = fitz.open(d.pdf_path)
-    for q in qs:
-        if q["type"] == "text":
-            final.append({"no": q["no"], "text": q.get("text", "")})
-        else:
-            pix = doc[q["page"] - 1].get_pixmap(
-                matrix=fitz.Matrix(ZOOM, ZOOM),
-                clip=fitz.Rect(*(x / ZOOM for x in q["rect"])))
-            final.append({"no": q["no"],
-                          "image_b64": base64.b64encode(pix_png(pix)).decode()})
-    doc.close()
+    with PDF_LOCK:
+        doc = open_draft_pdf(draft_id)
+        try:
+            for q in qs:
+                if q["type"] == "text":
+                    final.append({"no": q["no"], "text": q.get("text", "")})
+                else:
+                    pix = doc[q["page"] - 1].get_pixmap(
+                        matrix=fitz.Matrix(ZOOM, ZOOM),
+                        clip=fitz.Rect(*(x / ZOOM for x in q["rect"])))
+                    final.append({"no": q["no"],
+                                  "image_b64": base64.b64encode(pix_png(pix)).decode()})
+        finally:
+            doc.close()
     s = db.SessionLocal()
-    d = s.get(db.Draft, draft_id)
-    d.final_questions = json.dumps(final)
-    d.status = "published"
-    s.commit()
-    s.close()
+    try:
+        d = s.get(db.Draft, draft_id)
+        d.final_questions = json.dumps(final)
+        d.status = "published"
+        s.commit()
+    finally:
+        s.close()
     return {"draft_id": draft_id, "status": "published", "url": f"/t/{draft_id}"}
 
 
@@ -608,17 +717,20 @@ def finalize_draft(draft_id: int, body: dict = Body(...),
     settings["title"] = draft_title
 
     final = []
-    doc = fitz.open(d.pdf_path)
-    for q in qs:
-        if q["type"] == "text":
-            final.append({"no": q["no"], "text": q.get("text", "")})
-        else:
-            pix = doc[q["page"] - 1].get_pixmap(
-                matrix=fitz.Matrix(ZOOM, ZOOM),
-                clip=fitz.Rect(*(x / ZOOM for x in q["rect"])))
-            final.append({"no": q["no"],
-                          "image_b64": base64.b64encode(pix_png(pix)).decode()})
-    doc.close()
+    with PDF_LOCK:
+        doc = open_draft_pdf(draft_id)
+        try:
+            for q in qs:
+                if q["type"] == "text":
+                    final.append({"no": q["no"], "text": q.get("text", "")})
+                else:
+                    pix = doc[q["page"] - 1].get_pixmap(
+                        matrix=fitz.Matrix(ZOOM, ZOOM),
+                        clip=fitz.Rect(*(x / ZOOM for x in q["rect"])))
+                    final.append({"no": q["no"],
+                                  "image_b64": base64.b64encode(pix_png(pix)).decode()})
+        finally:
+            doc.close()
 
     try:
         html = jp.render_final_html(final, answers, settings,
@@ -635,17 +747,20 @@ def finalize_draft(draft_id: int, body: dict = Body(...),
     size = os.path.getsize(fpath)
 
     s = db.SessionLocal()
-    fp = db.FinalPaper(title=draft_title, html_filename=fname, size=size,
-                       created_by=user, answer_key_url=answer_key_url)
-    s.add(fp)
-    d2 = s.get(db.Draft, draft_id)
-    if d2:
-        s.delete(d2)
-    s.commit()
-    final_id = fp.id
-    s.close()
+    try:
+        fp = db.FinalPaper(title=draft_title, html_filename=fname, size=size,
+                           created_by=user, answer_key_url=answer_key_url)
+        s.add(fp)
+        d2 = s.get(db.Draft, draft_id)
+        if d2:
+            s.delete(d2)
+        s.commit()
+        final_id = fp.id
+    finally:
+        s.close()
+    _PDF_CACHE.pop(draft_id, None)  # draft delete ho gaya, cache bhi saaf
 
-    # Draft ke saath PDF bhi hata do - HTML me sab kuch embedded hai (base64)
+    # Legacy disk PDF (agar purane draft se aaya ho) bhi hata do
     try:
         if d.pdf_path and os.path.exists(d.pdf_path):
             os.remove(d.pdf_path)
@@ -690,15 +805,17 @@ def final_download(final_id: int, background_tasks: BackgroundTasks,
 def final_delete(final_id: int, authorization: str | None = Header(None)):
     require_admin(authorization)
     s = db.SessionLocal()
-    f = s.get(db.FinalPaper, final_id)
-    if f:
-        try:
-            os.remove(os.path.join(FINAL_DIR, f.html_filename))
-        except OSError:
-            pass
-        s.delete(f)
-        s.commit()
-    s.close()
+    try:
+        f = s.get(db.FinalPaper, final_id)
+        if f:
+            try:
+                os.remove(os.path.join(FINAL_DIR, f.html_filename))
+            except OSError:
+                pass
+            s.delete(f)
+            s.commit()
+    finally:
+        s.close()
     return {"ok": True}
 
 
@@ -760,4 +877,6 @@ a{display:inline-block;margin-top:16px;padding:12px 24px;background:#2563eb;colo
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True)
+    uvicorn.run("main:app", host="0.0.0.0",
+                port=int(os.environ.get("PORT", "8000")),
+                reload=os.environ.get("DEBUG") == "1")

@@ -1,8 +1,22 @@
-from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, func
+# database.py - Saurabh Daddy Test Series v3.4
+# FIX: Render free ki disk ephemeral hai => ab data Postgres (DATABASE_URL) me save hota hai.
+#      Restart / OOM / crash ke baad bhi kuch nahi udta.
+#      Locally bina env ke chalao to SQLite fallback (cbt.db) use hota hai.
+import os
+
+from sqlalchemy import (create_engine, Column, Integer, String, Text, DateTime,
+                        LargeBinary, func)
 from sqlalchemy.orm import declarative_base, sessionmaker
 
-engine = create_engine("sqlite:///cbt.db", connect_args={"check_same_thread": False})
-SessionLocal = sessionmaker(bind=engine, autoflush=False)
+DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///cbt.db")
+_is_sqlite = DATABASE_URL.startswith("sqlite")
+
+engine_kwargs = {"pool_pre_ping": True}   # Neon/Supabase scale-to-zero ke baad connection reset
+if _is_sqlite:
+    engine_kwargs["connect_args"] = {"check_same_thread": False}
+
+engine = create_engine(DATABASE_URL, **engine_kwargs)
+SessionLocal = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
 Base = declarative_base()
 
 
@@ -10,7 +24,8 @@ class Draft(Base):
     __tablename__ = "drafts"
     id = Column(Integer, primary_key=True)
     title = Column(String, default="Untitled Test")
-    pdf_path = Column(String)
+    pdf_path = Column(String)                      # legacy (purane disk wale drafts ke liye)
+    pdf_data = Column(LargeBinary, nullable=True)  # NEW: PDF bytes Postgres me => restart ke baad bhi resume
     page_count = Column(Integer, default=0)
     status = Column(String, default="building")
     questions = Column(Text, default="[]")
@@ -45,27 +60,27 @@ Base.metadata.create_all(engine)
 
 
 def ensure_schema():
-    import sqlite3
-    con = sqlite3.connect("cbt.db")
-    cur = con.cursor()
-    tables = {r[0] for r in cur.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-    if "users" in tables:
-        cols = {r[1] for r in cur.execute("PRAGMA table_info(users)")}
-        if "name" not in cols:
-            cur.execute("ALTER TABLE users ADD COLUMN name VARCHAR DEFAULT ''")
-        if "password_hash" not in cols:
-            cur.execute("ALTER TABLE users ADD COLUMN password_hash VARCHAR")
-    if "final_papers" in tables:
-        cols = {r[1] for r in cur.execute("PRAGMA table_info(final_papers)")}
-        if "answer_key_url" not in cols:
-            cur.execute("ALTER TABLE final_papers ADD COLUMN answer_key_url TEXT DEFAULT ''")
-    else:
-        cur.execute("""CREATE TABLE final_papers (id INTEGER PRIMARY KEY,
-            title VARCHAR DEFAULT 'Untitled Test', html_filename VARCHAR,
-            size INTEGER DEFAULT 0, created_by VARCHAR DEFAULT '',
-            answer_key_url TEXT DEFAULT '', created_at DATETIME)""")
-    con.commit()
-    con.close()
+    """Sirf purane SQLite cbt.db ke liye missing columns add karta hai.
+       Naya Postgres DB to create_all() ne khud bana diya hota hai."""
+    if not _is_sqlite:
+        return
+    from sqlalchemy import inspect as sa_inspect, text
+    insp = sa_inspect(engine)
+    with engine.begin() as con:
+        if insp.has_table("users"):
+            cols = {c["name"] for c in insp.get_columns("users")}
+            if "name" not in cols:
+                con.execute(text("ALTER TABLE users ADD COLUMN name VARCHAR DEFAULT ''"))
+            if "password_hash" not in cols:
+                con.execute(text("ALTER TABLE users ADD COLUMN password_hash VARCHAR"))
+        if insp.has_table("drafts"):
+            cols = {c["name"] for c in insp.get_columns("drafts")}
+            if "pdf_data" not in cols:
+                con.execute(text("ALTER TABLE drafts ADD COLUMN pdf_data BLOB"))
+        if insp.has_table("final_papers"):
+            cols = {c["name"] for c in insp.get_columns("final_papers")}
+            if "answer_key_url" not in cols:
+                con.execute(text("ALTER TABLE final_papers ADD COLUMN answer_key_url TEXT DEFAULT ''"))
 
 
 ensure_schema()
