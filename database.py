@@ -1,8 +1,7 @@
 # database.py - Saurabh Daddy Test Series v3.5
-# FIX: Render free ki disk ephemeral hai => ab data Postgres (DATABASE_URL) me save hota hai.
-#      Restart / OOM / crash ke baad bhi kuch nahi udta.
-#      Locally bina env ke chalao to SQLite fallback (cbt.db) use hota hai.
-# v3.5: Render par DATABASE_URL missing ho to app start hi nahi hota (data loss guard)
+# FIX: server ki disk ephemeral hai => data Postgres (DATABASE_URL) me save hota hai.
+#      Restart / crash ke baad bhi kuch nahi udta.
+#      SQLite fallback sirf LOCAL (apne computer) ke liye hai.
 import os
 
 from sqlalchemy import (create_engine, Column, Integer, String, Text, DateTime,
@@ -11,23 +10,23 @@ from sqlalchemy.orm import declarative_base, sessionmaker
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///cbt.db")
 
-# SAFETY: Render par bina DATABASE_URL ke SQLite chala to har restart par data udega.
-# Silent fallback sirf LOCAL dev ke liye hai - Render par to seedha fail karo.
-if os.environ.get("RENDER") and not os.environ.get("DATABASE_URL"):
+# SAFETY: bina DATABASE_URL ke server par chalane ka matlab hai data loss.
+# SQLite fallback sirf LOCAL ke liye hai - server par app start hi nahi hoga.
+if not os.environ.get("DATABASE_URL") and not os.environ.get("ALLOW_SQLITE"):
     raise RuntimeError(
-        "DATABASE_URL not set! Render par SQLite use karna = data loss guaranteed. "
-        "Neon (neon.tech) se connection string lo aur Render > Environment > "
-        "DATABASE_URL me daalo, phir redeploy karo."
+        "DATABASE_URL not set! SQLite sirf local dev ke liye hai. "
+        "Koyeb/Neon se connection string lo aur env me DATABASE_URL set karo, "
+        "phir redeploy karo."
     )
 
 if os.environ.get("DATABASE_URL"):
     print("DB: PostgreSQL (" + str(DATABASE_URL).split("@")[-1].split("/")[0] + ")")
 else:
-    print("DB: SQLITE (local only - Render par ye DATA LOSS hai)")
+    print("DB: SQLITE (local only - server par ye DATA LOSS hai)")
 
 _is_sqlite = DATABASE_URL.startswith("sqlite")
 
-engine_kwargs = {"pool_pre_ping": True}   # Neon scale-to-zero ke baad connection reset
+engine_kwargs = {"pool_pre_ping": True}   # scale-to-zero ke baad connection reset
 if _is_sqlite:
     engine_kwargs["connect_args"] = {"check_same_thread": False}
 
@@ -41,7 +40,7 @@ class Draft(Base):
     id = Column(Integer, primary_key=True)
     title = Column(String, default="Untitled Test")
     pdf_path = Column(String)                      # legacy (purane disk wale drafts ke liye)
-    pdf_data = Column(LargeBinary, nullable=True)  # NEW: PDF bytes Postgres me => restart ke baad bhi resume
+    pdf_data = Column(LargeBinary, nullable=True)  # PDF bytes DB me => restart ke baad bhi resume
     page_count = Column(Integer, default=0)
     status = Column(String, default="building")
     questions = Column(Text, default="[]")
@@ -76,8 +75,7 @@ Base.metadata.create_all(engine)
 
 
 def ensure_schema():
-    """Sirf purane SQLite cbt.db ke liye missing columns add karta hai.
-       Naya Postgres DB to create_all() ne khud bana diya hota hai."""
+    """Sirf purane SQLite cbt.db ke liye missing columns add karta hai."""
     if not _is_sqlite:
         return
     from sqlalchemy import inspect as sa_inspect, text

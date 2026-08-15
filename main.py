@@ -1,7 +1,7 @@
 # main.py - Saurabh Daddy Test Series (Manual CBT Builder) v3.5
 # v3.5: /health ab batata hai ki DB Postgres hai ya SQLite (deploy verify karna easy)
 # v3.4 fixes (v3.3 ke upar):
-#  - PDF ab database me save hota hai (pdf_data) => Render restart/OOM ke baad bhi
+#  - PDF ab database me save hota hai (pdf_data) => server restart/OOM ke baad bhi
 #    draft click karte hi pura resume (page images + crops + answers) milta hai
 #  - PDF bytes memory cache => har request par DB hit nahi, fast rahta hai
 # v3.3 fixes (yahi the):
@@ -50,7 +50,7 @@ app = FastAPI(title="Manual CBT Builder", version="3.5", docs_url=None, redoc_ur
 # ================= SAFETY (505/OOM + data loss fix) =================
 
 # PDF rendering ko serial karo => ek saath kai requests PDF na kholen,
-# warna memory spike hoke Render container crash karta hai (505 + data udna)
+# warna memory spike hoke server crash karta hai (505 + data udna)
 PDF_LOCK = Lock()
 
 # SQLite WAL mode => process beech me mar jaye tab bhi last committed data safe
@@ -69,7 +69,7 @@ if getattr(db, "engine", None) is not None:
         pass
 
 # ============ PDF IN DATABASE (restart ke baad bhi resume) ============
-# Render free ki disk ephemeral hai - isliye PDF bytes DB me rakhte hain.
+# Server ki disk ephemeral hai - isliye PDF bytes DB me rakhte hain.
 # Memory cache => baar-baar DB query nahi karni padti.
 
 _PDF_CACHE: dict = {}
