@@ -1,5 +1,6 @@
-# main.py - Saurabh Daddy Test Series (Manual CBT Builder) v3.1
-# v3.1: insert-question endpoint + storage cleanup + auto-delete after download
+# main.py - Saurabh Daddy Test Series (Manual CBT Builder) v3.2
+# v3.2: seed_users ab har startup par admin/admin123 force-reset karta hai
+#       => purana cbt.db repo me chala jaye to bhi login kabhi fail nahi hoga
 from __future__ import annotations
 
 import base64
@@ -33,7 +34,7 @@ FINAL_DIR = os.path.join(BASE_DIR, "final_html")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(FINAL_DIR, exist_ok=True)
 
-app = FastAPI(title="Manual CBT Builder", version="3.1", docs_url=None, redoc_url=None)
+app = FastAPI(title="Manual CBT Builder", version="3.2", docs_url=None, redoc_url=None)
 
 
 # ================= AUTH =================
@@ -47,10 +48,16 @@ def user_token(username: str, password_hash: str) -> str:
 
 
 def seed_users():
+    """Har startup par force: admin/admin123 current secret ke saath.
+    Purana cbt.db (galat secret wala) bhi mil jaye to login 100% chalega."""
     s = db.SessionLocal()
-    if s.query(db.User).count() == 0:
-        s.add(db.User(name="Admin", username="admin", password_hash=hash_password("admin123")))
-        s.commit()
+    u = s.query(db.User).filter(db.User.username == "admin").first()
+    if u is None:
+        s.add(db.User(name="Admin", username="admin",
+                      password_hash=hash_password("admin123")))
+    else:
+        u.password_hash = hash_password("admin123")
+    s.commit()
     s.close()
 
 
