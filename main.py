@@ -1,4 +1,5 @@
-# main.py - Saurabh Daddy Test Series (Manual CBT Builder) v3.4
+# main.py - Saurabh Daddy Test Series (Manual CBT Builder) v3.5
+# v3.5: /health ab batata hai ki DB Postgres hai ya SQLite (deploy verify karna easy)
 # v3.4 fixes (v3.3 ke upar):
 #  - PDF ab database me save hota hai (pdf_data) => Render restart/OOM ke baad bhi
 #    draft click karte hi pura resume (page images + crops + answers) milta hai
@@ -43,7 +44,7 @@ FINAL_DIR = os.path.join(BASE_DIR, "final_html")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(FINAL_DIR, exist_ok=True)
 
-app = FastAPI(title="Manual CBT Builder", version="3.4", docs_url=None, redoc_url=None)
+app = FastAPI(title="Manual CBT Builder", version="3.5", docs_url=None, redoc_url=None)
 
 
 # ================= SAFETY (505/OOM + data loss fix) =================
@@ -264,7 +265,10 @@ def home() -> str:
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    db_url = str(db.engine.url)
+    return {"status": "ok",
+            "db": "postgres" if not db_url.startswith("sqlite") else "sqlite",
+            "version": "3.5"}
 
 
 @app.get("/t/{draft_id}", response_class=HTMLResponse)

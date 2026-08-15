@@ -1,7 +1,8 @@
-# database.py - Saurabh Daddy Test Series v3.4
+# database.py - Saurabh Daddy Test Series v3.5
 # FIX: Render free ki disk ephemeral hai => ab data Postgres (DATABASE_URL) me save hota hai.
 #      Restart / OOM / crash ke baad bhi kuch nahi udta.
 #      Locally bina env ke chalao to SQLite fallback (cbt.db) use hota hai.
+# v3.5: Render par DATABASE_URL missing ho to app start hi nahi hota (data loss guard)
 import os
 
 from sqlalchemy import (create_engine, Column, Integer, String, Text, DateTime,
@@ -9,9 +10,24 @@ from sqlalchemy import (create_engine, Column, Integer, String, Text, DateTime,
 from sqlalchemy.orm import declarative_base, sessionmaker
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///cbt.db")
+
+# SAFETY: Render par bina DATABASE_URL ke SQLite chala to har restart par data udega.
+# Silent fallback sirf LOCAL dev ke liye hai - Render par to seedha fail karo.
+if os.environ.get("RENDER") and not os.environ.get("DATABASE_URL"):
+    raise RuntimeError(
+        "DATABASE_URL not set! Render par SQLite use karna = data loss guaranteed. "
+        "Neon (neon.tech) se connection string lo aur Render > Environment > "
+        "DATABASE_URL me daalo, phir redeploy karo."
+    )
+
+if os.environ.get("DATABASE_URL"):
+    print("DB: PostgreSQL (" + str(DATABASE_URL).split("@")[-1].split("/")[0] + ")")
+else:
+    print("DB: SQLITE (local only - Render par ye DATA LOSS hai)")
+
 _is_sqlite = DATABASE_URL.startswith("sqlite")
 
-engine_kwargs = {"pool_pre_ping": True}   # Neon/Supabase scale-to-zero ke baad connection reset
+engine_kwargs = {"pool_pre_ping": True}   # Neon scale-to-zero ke baad connection reset
 if _is_sqlite:
     engine_kwargs["connect_args"] = {"check_same_thread": False}
 
