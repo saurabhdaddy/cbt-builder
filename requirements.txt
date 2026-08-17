@@ -3,4 +3,5 @@ uvicorn[standard]
 python-multipart
 sqlalchemy
 pymupdf
+python-dotenv
 psycopg2-binary

@@ -1,8 +1,17 @@
-# database.py - Saurabh Daddy Test Series v3.5
-# FIX: server ki disk ephemeral hai => data Postgres (DATABASE_URL) me save hota hai.
-#      Restart / crash ke baad bhi kuch nahi udta.
-#      SQLite fallback sirf LOCAL (apne computer) ke liye hai.
+# database.py - v3.7 (LOCAL-FIRST + .env support)
+# - Bina DATABASE_URL ke => SQLite (cbt.db) => LOCAL par sab save, kuch nahi udta
+# - .env file banaoge => wo khud padh lega (DATABASE_URL + CBT_SECRET)
+# - Cloud par deploy karte waqt galti se SQLite chala ke data loss na ho,
+#   uske liye REQUIRE_POSTGRES=1 env set karna hoga (tabhi guard active hota hai)
 import os
+from pathlib import Path
+
+# ---- .env file automatically load (agar hai to) ----
+try:
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).parent / ".env")
+except ImportError:
+    pass  # python-dotenv nahi hai to .env skip (local SQLite fir bhi chalega)
 
 from sqlalchemy import (create_engine, Column, Integer, String, Text, DateTime,
                         LargeBinary, func)
@@ -10,23 +19,28 @@ from sqlalchemy.orm import declarative_base, sessionmaker
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///cbt.db")
 
-# SAFETY: bina DATABASE_URL ke server par chalane ka matlab hai data loss.
-# SQLite fallback sirf LOCAL ke liye hai - server par app start hi nahi hoga.
-if not os.environ.get("DATABASE_URL") and not os.environ.get("ALLOW_SQLITE"):
+# ---- Cloud guard (sirf tab active jab REQUIRE_POSTGRES=1 ho) ----
+if os.environ.get("REQUIRE_POSTGRES") and not os.environ.get("DATABASE_URL"):
     raise RuntimeError(
-        "DATABASE_URL not set! SQLite sirf local dev ke liye hai. "
-        "Koyeb/Neon se connection string lo aur env me DATABASE_URL set karo, "
-        "phir redeploy karo."
+        "DATABASE_URL not set! Cloud deploy kar rahe ho to connection string "
+        "env me daalo. Local chalana hai to ye variable MAT daalo."
     )
 
-if os.environ.get("DATABASE_URL"):
-    print("DB: PostgreSQL (" + str(DATABASE_URL).split("@")[-1].split("/")[0] + ")")
+# ---- Postgres driver check (sirf jab postgres URL ho) ----
+if DATABASE_URL.startswith("postgres"):
+    try:
+        import psycopg2  # noqa: F401
+    except ImportError:
+        raise RuntimeError(
+            "psycopg2-binary install nahi hai. Command: pip install psycopg2-binary"
+        )
+    print("DB: PostgreSQL -> " + str(DATABASE_URL).split("@")[-1].split("/")[0])
 else:
-    print("DB: SQLITE (local only - server par ye DATA LOSS hai)")
+    print("DB: SQLITE (local) -> cbt.db file me save hota hai")
 
 _is_sqlite = DATABASE_URL.startswith("sqlite")
 
-engine_kwargs = {"pool_pre_ping": True}   # scale-to-zero ke baad connection reset
+engine_kwargs = {"pool_pre_ping": True}
 if _is_sqlite:
     engine_kwargs["connect_args"] = {"check_same_thread": False}
 
@@ -39,8 +53,8 @@ class Draft(Base):
     __tablename__ = "drafts"
     id = Column(Integer, primary_key=True)
     title = Column(String, default="Untitled Test")
-    pdf_path = Column(String)                      # legacy (purane disk wale drafts ke liye)
-    pdf_data = Column(LargeBinary, nullable=True)  # PDF bytes DB me => restart ke baad bhi resume
+    pdf_path = Column(String)                       # legacy (purane disk drafts)
+    pdf_data = Column(LargeBinary, nullable=True)   # PDF bytes DB me => crash/restart ke baad bhi resume
     page_count = Column(Integer, default=0)
     status = Column(String, default="building")
     questions = Column(Text, default="[]")
@@ -75,7 +89,7 @@ Base.metadata.create_all(engine)
 
 
 def ensure_schema():
-    """Sirf purane SQLite cbt.db ke liye missing columns add karta hai."""
+    """Purane SQLite cbt.db me missing columns add karne ke liye."""
     if not _is_sqlite:
         return
     from sqlalchemy import inspect as sa_inspect, text
