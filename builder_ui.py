@@ -124,15 +124,17 @@ var toastTimer=null;
 function toast(msg){var t=document.getElementById('toast');t.textContent=msg;t.classList.add('show');clearTimeout(toastTimer);toastTimer=setTimeout(function(){t.classList.remove('show');},2200);}
 
 async function load(){
-  var d=await api('/api/admin/draft/'+DRAFT_ID,{headers:authHeaders()});
-  st.questions=d.questions||[];
-  st.pageCount=d.page_count||1;
-  st.title=d.title||'';
-  document.getElementById('dtitle').textContent=st.title;
-  if(st.page<1||st.page>st.pageCount)st.page=1;
-  renderPages();renderQuestions();renderPage();renderModeBar();
+  try{
+    var d=await api('/api/admin/draft/'+DRAFT_ID,{headers:authHeaders()});
+    st.questions=d.questions||[];
+    st.pageCount=d.page_count||1;
+    st.title=d.title||'';
+    document.getElementById('dtitle').textContent=st.title;
+    if(st.page<1||st.page>st.pageCount)st.page=1;
+    renderPages();renderQuestions();renderModeBar();
+    setPage(st.page);  // 🔥 FIX: page viewer ko properly initialize karta hai
+  }catch(e){toast('Load error: '+e.message);throw e;}
 }
-
 function renderPages(){
   var h='';
   h+='<button class="pg top'+(st.mode==='insert'&&st.refNo===0?' on':'')+'" onclick="insertTop()">+ TOP</button>';
